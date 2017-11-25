@@ -1,9 +1,12 @@
+#define _POSIX_C_SOURCE 200809L
+
 #ifdef HAVE_CONFIG_H
 #include <config.h>
 #endif
 #include "maxminddb.h"
 #include <errno.h>
 #include <getopt.h>
+#include <libfastjson/json.h>
 #ifndef _WIN32
 #include <pthread.h>
 #endif
@@ -48,6 +51,8 @@ LOCAL bool start_threaded_benchmark(
     int const thread_count,
     int const iterations);
 LOCAL void *thread(void *arg);
+LOCAL void str_split(char **membuf);
+LOCAL bool tryjson(json_object *const total_json);
 /* --prototypes end - don't remove this comment-- */
 /* *INDENT-ON* */
 
@@ -527,9 +532,108 @@ LOCAL void *thread(void *arg)
             return NULL;
         }
 
+        char *buf = NULL;
+        size_t bufsz = 0;
+        FILE *const fh = open_memstream(&buf, &bufsz);
+        if (!fh) {
+            fprintf(stderr, "open_memstream() failed: %s\n", strerror(errno));
+            MMDB_free_entry_data_list(entry_data_list);
+            return NULL;
+        }
+
+        if (MMDB_dump_entry_data_list(fh, entry_data_list, 2) != MMDB_SUCCESS) {
+            fprintf(stderr, "MMDB_dump_entry_data_list() failed\n");
+            MMDB_free_entry_data_list(entry_data_list);
+            fclose(fh);
+            free(buf);
+            return NULL;
+        }
+
         MMDB_free_entry_data_list(entry_data_list);
+
+        if (fclose(fh) != 0) {
+            fprintf(stderr, "fclose() failed: %s\n", strerror(errno));
+            free(buf);
+            return NULL;
+        }
+
+        str_split(&buf);
+
+        json_object *const obj = json_tokener_parse(buf);
+        if (!obj) {
+            fprintf(stderr, "json_tokener_parse() failed\n");
+            free(buf);
+            return NULL;
+        }
+
+        free(buf);
+
+        if (!tryjson(obj)) {
+            fprintf(stderr, "tryjson() failed\n");
+            json_object_put(obj);
+            return NULL;
+        }
+
+        json_object_put(obj);
     }
 
     return NULL;
 #endif
+}
+
+LOCAL void str_split(char **membuf)
+{
+    char *buf = *membuf;
+    char tempbuf[strlen(buf)];
+    memset(tempbuf, 0, strlen(buf));
+
+    while (*buf++ != '\0') {
+        if (*buf == '\n' || *buf == '\t' || *buf == ' ') {
+            continue;
+        } else{
+            if (*buf == '<') {
+                char *p = strchr(buf, '>');
+                buf = buf + (int)(p - buf);
+                strcat(tempbuf, ",");
+            } else if (*buf == '}') {
+                strcat(tempbuf, "},");
+            } else{
+                strncat(tempbuf, buf, 1);
+            }
+        }
+    }
+
+    tempbuf[strlen(tempbuf) + 1] = '\n';
+    memcpy(*membuf, tempbuf, strlen(tempbuf));
+}
+
+LOCAL bool tryjson(json_object *const total_json)
+{
+    char *fields[] = {
+        "continent!names!zh-CN",
+        "country!iso_code",
+        "subdivisions",
+        "city!names!zh-CN",
+        "location!latitude",
+        "location!longitude",
+    };
+
+    char buf[256] = { 0 };
+    for (int i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+        memset(buf, 0, 256);
+        strcpy(buf, fields[i]);
+
+        json_object *temp_json = total_json;
+        json_object *sub_obj = temp_json;
+        const char *SEP = "!";
+
+        char *s = strtok(buf, SEP);
+        for (; s != NULL;) {
+            json_object_object_get_ex(temp_json, s, &sub_obj);
+            temp_json = sub_obj;
+            s = strtok(NULL, SEP);
+        }
+    }
+
+    return true;
 }
