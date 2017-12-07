@@ -1,37 +1,59 @@
 #include "data-pool.h"
 #include "maxminddb.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdlib.h>
 
 static bool can_multiply(size_t const, size_t const, size_t const);
+static MMDB_entry_data_list_s *data_pool_get_list_head(
+    MMDB_entry_data_list_s *const);
 
 // Allocate an MMDB_data_pool_s. It initially has space for size
 // MMDB_entry_data_list_s structs.
 //
-// The memory must be freed by the caller. You can choose to keep the memory in
-// the data field around separately from the pool.
+// You must free it using data_pool_destroy().
 MMDB_data_pool_s *data_pool_new(size_t const size)
 {
-    if (size == 0 ||
-        !can_multiply(SIZE_MAX, size, sizeof(MMDB_entry_data_list_s))) {
-        return NULL;
-    }
-
     MMDB_data_pool_s *const pool = calloc(1, sizeof(MMDB_data_pool_s));
     if (!pool) {
         return NULL;
     }
 
-    pool->data = calloc(size, sizeof(MMDB_entry_data_list_s));
-    if (!pool->data) {
-        data_pool_destroy(pool);
+    // This should be high enough that we never need to grow the array of
+    // pointers to blocks. 32 is more than enough. Even starting out of with
+    // size 1 (1 struct), the 32nd element alone will provide us 2**32 structs
+    // due to us exponentially increasing the numbers of structs that can fit
+    // in each block of memory. Being confident that we do not have to grow the
+    // array lets us avoid writing code to do that. That code would be risky as
+    // it would likely rarely be hit and so likely not be well tested.
+    pool->count = 32;
+
+    if (!can_multiply(SIZE_MAX, pool->count,
+                      sizeof(MMDB_entry_data_list_s *))) {
+        data_pool_destroy(pool, false);
+        return NULL;
+    }
+    pool->blocks = calloc(pool->count, sizeof(MMDB_entry_data_list_s *));
+    if (!pool->blocks) {
+        data_pool_destroy(pool, false);
         return NULL;
     }
 
+    if (size == 0 ||
+        !can_multiply(SIZE_MAX, size, sizeof(MMDB_entry_data_list_s))) {
+        data_pool_destroy(pool, false);
+        return NULL;
+    }
     pool->size = size;
-    pool->max_bytes = SIZE_MAX;
-    pool->num_allocs = 1;
+    pool->blocks[pool->index] = calloc(pool->size,
+                                       sizeof(MMDB_entry_data_list_s));
+    if (!pool->blocks[pool->index]) {
+        data_pool_destroy(pool, false);
+        return NULL;
+    }
+
+    pool->blocks[pool->index]->head = true;
 
     return pool;
 }
@@ -49,15 +71,26 @@ static bool can_multiply(size_t const max, size_t const m, size_t const n)
     return n <= max / m;
 }
 
-// Free an MMDB_data_pool_s.
-void data_pool_destroy(MMDB_data_pool_s *const pool)
+// Clean up the data pool.
+//
+// You can choose to keep the list elements around separate from the pool
+// itself by passing keep_list as true. This is useful once you have no further
+// use for the pool's management. If you do, you must clean up the list using
+// data_pool_list_destroy().
+void data_pool_destroy(MMDB_data_pool_s *const pool, bool const keep_list)
 {
     if (!pool) {
         return;
     }
 
-    if (pool->data) {
-        free(pool->data);
+    if (pool->blocks) {
+        if (!keep_list) {
+            for (size_t i = 0; i <= pool->index; i++) {
+                free(pool->blocks[i]);
+            }
+        }
+
+        free(pool->blocks);
     }
 
     free(pool);
@@ -65,90 +98,97 @@ void data_pool_destroy(MMDB_data_pool_s *const pool)
 
 // Claim a new struct from the pool. Doing this may cause the pool's size to
 // grow.
-//
-// The new struct will be accessible at the index via data_pool_lookup().
-//
-// We return 0 if there is no error, and non-zero if there is.
-int data_pool_alloc(MMDB_data_pool_s *const pool, size_t *const index)
+MMDB_entry_data_list_s *data_pool_alloc(MMDB_data_pool_s *const pool)
 {
-    if (!pool || !pool->data) {
-        return -1;
+    if (pool->used < pool->size) {
+        MMDB_entry_data_list_s *const element = pool->blocks[pool->index] +
+                                                pool->used;
+
+        if (pool->used > 0) {
+            MMDB_entry_data_list_s *const prev = pool->blocks[pool->index] +
+                                                 pool->used - 1;
+            prev->next = element;
+        }
+
+        pool->used++;
+        return element;
     }
 
-    if (pool->used_size < pool->size) {
-        *index = pool->used_size;
-        pool->used_size++;
-        return 0;
-    }
+    // Take it from a new block of memory.
 
-    // Grow.
+    size_t const new_index = pool->index + 1;
+    if (new_index == pool->count) {
+        // See the comment about not growing this in data_pool_new().
+        return NULL;
+    }
 
     if (!can_multiply(SIZE_MAX, pool->size, 2)) {
-        return -1;
+        return NULL;
     }
     size_t const new_size = pool->size * 2;
 
-    if (!can_multiply(pool->max_bytes, new_size,
-                      sizeof(MMDB_entry_data_list_s))) {
-        return -1;
+    if (!can_multiply(SIZE_MAX, new_size, sizeof(MMDB_entry_data_list_s))) {
+        return NULL;
     }
-    size_t const new_size_bytes = sizeof(MMDB_entry_data_list_s) * new_size;
-
-    MMDB_entry_data_list_s *new_data = realloc(pool->data, new_size_bytes);
-    if (!new_data) {
-        return -1;
+    pool->blocks[new_index] = calloc(new_size, sizeof(MMDB_entry_data_list_s));
+    if (!pool->blocks[new_index]) {
+        return NULL;
     }
-    pool->data = new_data;
 
-    // It would be nice to zero the new memory. Doing that is expensive
-    // however. We should not need to do it if we are careful about setting the
-    // next pointers when we link up the list.
+    pool->blocks[new_index]->head = true;
+    pool->index = new_index;
+
+    MMDB_entry_data_list_s *const prev = pool->blocks[pool->index - 1]
+                                         + pool->size - 1;
 
     pool->size = new_size;
-    pool->num_allocs++;
 
-    // Use the new space.
+    MMDB_entry_data_list_s *const element = pool->blocks[pool->index];
 
-    *index = pool->used_size;
-    pool->used_size++;
-    return 0;
+    prev->next = element;
+
+    pool->used = 1;
+    return element;
 }
 
-// Retrieve an entry by index in the array-like pool. This does not allocate an
-// entry.
-MMDB_entry_data_list_s *data_pool_lookup(
-    MMDB_data_pool_s const *const pool,
-    size_t const i
-    )
+// Destroy a linked list created using the data pool.
+//
+// This destroys only the linked list. This is useful if you used
+// data_pool_destroy() but kept the list around.
+bool data_pool_list_destroy(MMDB_entry_data_list_s *const list)
 {
-    if (!pool) {
-        return NULL;
+    // There are potentially multiple blocks of memory, each containing
+    // multiple list elements. We need to free each block, not each element.
+
+    MMDB_entry_data_list_s *element = list;
+    while (element) {
+        // We should always be at a head.
+        if (!element->head) {
+            return false;
+        }
+
+        MMDB_entry_data_list_s *const next_element = data_pool_get_list_head(
+            element->next);
+        free(element);
+        element = next_element;
     }
 
-    if (i >= pool->used_size) {
-        return NULL;
-    }
-
-    MMDB_entry_data_list_s *const l = pool->data + i;
-    return l;
+    return true;
 }
 
-// Turn the structs in the array-like pool into a linked list.
-MMDB_entry_data_list_s *data_pool_to_list(MMDB_data_pool_s *const pool)
+static MMDB_entry_data_list_s *data_pool_get_list_head(
+    MMDB_entry_data_list_s *const list)
 {
-    if (!pool || !pool->data || pool->used_size == 0) {
-        return NULL;
+    MMDB_entry_data_list_s *element = list;
+    while (element) {
+        if (element->head) {
+            return element;
+        }
+
+        element = element->next;
     }
 
-    for (size_t i = 0; i < pool->used_size - 1; i++) {
-        MMDB_entry_data_list_s *const cur = pool->data + i;
-        cur->next = pool->data + i + 1;
-    }
-
-    MMDB_entry_data_list_s *const last = pool->data + pool->used_size - 1;
-    last->next = NULL;
-
-    return pool->data;
+    return NULL;
 }
 
 #ifdef TEST_DATA_POOL
